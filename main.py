@@ -12,7 +12,7 @@ try:
 except Exception:
     ObjectId = None
 
-app = FastAPI(title="Honey Shop API", version="1.2.0")
+app = FastAPI(title="Honey Shop API", version="1.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,6 +31,43 @@ def to_str_id(doc: dict):
     if "_id" in d:
         d["id"] = str(d.pop("_id"))
     return d
+
+# -----------------------
+# Pricing/Tax/Shipping
+# -----------------------
+
+def calc_subtotal(items: List[OrderItem]) -> float:
+    return round(sum(max(0.0, i.price) * max(1, i.quantity) for i in items), 2)
+
+
+def calc_shipping(subtotal: float, destination: Optional[Customer]) -> float:
+    # Simple policy: $0 for orders >= $50 in US, else $5 flat; $12 international
+    country = (destination.country if destination else "US").upper()
+    if country != "US":
+        return 12.0 if subtotal > 0 else 0.0
+    if subtotal >= 50:
+        return 0.0
+    return 5.0 if subtotal > 0 else 0.0
+
+
+STATE_TAX = {
+    # Simple illustrative rates
+    "CA": 0.0825,
+    "NY": 0.088,
+    "TX": 0.0625,
+    "FL": 0.06,
+}
+
+
+def calc_tax(subtotal: float, shipping: float, destination: Optional[Customer]) -> float:
+    # Apply tax on goods only (not shipping) for simplicity
+    country = (destination.country if destination else "US").upper()
+    if country != "US":
+        return 0.0
+    state = (destination.state or "").upper() if destination else ""
+    rate = STATE_TAX.get(state, 0.07)  # default 7%
+    return round(subtotal * rate, 2)
+
 
 # Seed helpers (idempotent)
 
@@ -219,6 +256,35 @@ def create_category(payload: CreateCategory):
     inserted_id = create_document("category", payload)
     return {"id": inserted_id}
 
+# -------------------------
+# Pricing endpoints (quote)
+# -------------------------
+from pydantic import BaseModel
+
+class QuoteItem(BaseModel):
+    product_id: Optional[str] = None
+    title: str
+    price: float
+    quantity: int
+
+class QuoteRequest(BaseModel):
+    items: List[QuoteItem]
+    customer: Optional[Customer] = None
+
+@app.post("/api/pricing/quote")
+def pricing_quote(payload: QuoteRequest):
+    items = [OrderItem(product_id=i.product_id or "", title=i.title, price=i.price, quantity=i.quantity) for i in payload.items]
+    subtotal = calc_subtotal(items)
+    shipping = calc_shipping(subtotal, payload.customer)
+    tax = calc_tax(subtotal, shipping, payload.customer)
+    total = round(subtotal + shipping + tax, 2)
+    return {
+        "subtotal": round(subtotal, 2),
+        "shipping": round(shipping, 2),
+        "tax": round(tax, 2),
+        "total": total,
+    }
+
 # ---------------
 # Orders Endpoints
 # ---------------
@@ -231,8 +297,21 @@ def create_order(payload: CreateOrder):
     # Basic sanity check
     if not payload.items or len(payload.items) == 0:
         raise HTTPException(status_code=400, detail="Order must contain at least one item")
-    inserted_id = create_document("order", payload)
-    return {"id": inserted_id, "status": "received"}
+
+    # Recalculate server-side pricing for trust
+    subtotal = calc_subtotal(payload.items)
+    shipping_val = calc_shipping(subtotal, payload.customer)
+    tax_val = calc_tax(subtotal, shipping_val, payload.customer)
+    total_val = round(subtotal + shipping_val + tax_val, 2)
+
+    # Build a safe order snapshot
+    safe_order = payload.model_dump()
+    safe_order["subtotal"] = round(subtotal, 2)
+    safe_order["shipping"] = round(shipping_val, 2)
+    safe_order["total"] = total_val
+
+    inserted_id = create_document("order", safe_order)
+    return {"id": inserted_id, "status": "received", "subtotal": safe_order["subtotal"], "shipping": safe_order["shipping"], "tax": tax_val, "total": total_val}
 
 @app.get("/api/orders")
 def list_orders(limit: int = 50):
